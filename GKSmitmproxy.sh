@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# DISCLAIMER: For authorized testing only. Grants extensive permissions.
+# DISCLAIMER: This script is for authorized security testing and educational purposes only.
 
 # Check if Google Cloud SDK is installed, if not, install it
 if ! command -v gcloud &> /dev/null; then
@@ -74,3 +74,163 @@ spec:
 EOF
 
 echo "Setup complete. Service account, RBAC, and network policies configured."
+
+# Function to deploy Mitmproxy
+deploy_mitmproxy() {
+    echo "Deploying Mitmproxy in the $NAMESPACE namespace..."
+
+    # Deploy Mitmproxy pod
+    kubectl apply -n $NAMESPACE -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mitmproxy
+  labels:
+    app: mitmproxy
+spec:
+  containers:
+  - name: mitmproxy
+    image: mitmproxy/mitmproxy
+    command: ["mitmweb"]
+    args: ["--web-host", "0.0.0.0"]
+EOF
+
+    # Deploy Mitmproxy service
+    kubectl apply -n $NAMESPACE -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: mitmproxy-svc
+spec:
+  selector:
+    app: mitmproxy
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+EOF
+}
+
+# Function to detect which service mesh is being used
+detect_service_mesh() {
+    if kubectl get namespace -L istio-injection | grep -q 'enabled'; then
+        echo "Istio"
+    elif kubectl get namespace -L linkerd.io/inject | grep -q 'enabled'; then
+        echo "Linkerd"
+    else
+        echo "None"
+    fi
+}
+
+# Function to modify Istio policies
+modify_istio_policies() {
+    echo "Modifying Istio policies..."
+
+    # Disable automatic sidecar injection for Mitmproxy pod
+    kubectl label namespace $NAMESPACE istio-injection=disabled --overwrite
+
+    # Apply Istio Gateway for external access
+    # Note: Replace mitmproxy.example.com with your domain
+    kubectl apply -n $NAMESPACE -f - <<EOF
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: mitmproxy-gateway
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+  - port:
+      number: 8080
+      name: http
+      protocol: HTTP
+    hosts:
+    - "mitmproxy.example.com"
+EOF
+
+    # Apply Istio VirtualService for routing
+    kubectl apply -n $NAMESPACE -f - <<EOF
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: mitmproxy
+spec:
+  hosts:
+  - "mitmproxy.example.com"
+  gateways:
+  - mitmproxy-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: mitmproxy-svc
+        port:
+          number: 8080
+EOF
+
+    # Apply Istio AuthorizationPolicy (allow all for this example)
+    kubectl apply -n $NAMESPACE -f - <<EOF
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-all
+spec:
+  action: ALLOW
+  rules:
+  - {}
+EOF
+}
+
+# Function to modify Linkerd policies
+modify_linkerd_policies() {
+    echo "Modifying Linkerd policies..."
+
+    # Annotate the namespace to disable Linkerd proxy injection
+    kubectl annotate namespace $NAMESPACE linkerd.io/inject=disabled --overwrite
+
+    # Find the Mitmproxy deployment name
+    MITMPROXY_DEPLOYMENT=$(kubectl get deployment -n $NAMESPACE -l app=mitmproxy -o jsonpath="{.items[0].metadata.name}")
+    
+    # Check if a deployment was found
+    if [ -z "$MITMPROXY_DEPLOYMENT" ]; then
+        echo "Mitmproxy deployment not found. Exiting."
+        exit 1
+    fi
+
+    echo "Mitmproxy deployment found: $MITMPROXY_DEPLOYMENT"
+
+    # Inject Linkerd proxy into the Mitmproxy deployment
+    kubectl get deployment -n $NAMESPACE $MITMPROXY_DEPLOYMENT -o yaml | linkerd inject - | kubectl apply -f -
+
+    # Additional Linkerd-specific configurations can be added here
+    # For example, configuring traffic splits, service profiles, etc.
+}
+
+# Function to modify service mesh policies
+modify_service_mesh_policies() {
+    SERVICE_MESH=$(detect_service_mesh)
+
+    case $SERVICE_MESH in
+        Istio)
+            modify_istio_policies
+            ;;
+        Linkerd)
+            modify_linkerd_policies
+            ;;
+        None)
+            echo "No service mesh detected. No additional modifications needed."
+            ;;
+        *)
+            echo "Unknown service mesh. Exiting."
+            exit 1
+            ;;
+    esac
+}
+
+# Main execution
+echo "Starting the attack simulation..."
+deploy_mitmproxy
+modify_service_mesh_policies
+echo "Attack simulation complete."

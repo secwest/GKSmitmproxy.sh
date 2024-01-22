@@ -47,8 +47,6 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member "serviceAccount:$SERVICE_ACCOUNT_NAME@$PROJECT_ID.iam.gserviceaccount.com" \
     --role "roles/container.admin"
 
-# Add more roles as needed...
-
 # Get credentials for your GKE cluster
 gcloud container clusters get-credentials $CLUSTER_NAME --zone $CLUSTER_LOCATION --project $PROJECT_ID
 
@@ -75,8 +73,8 @@ EOF
 
 echo "Setup complete. Service account, RBAC, and network policies configured."
 
-# Function to deploy Mitmproxy
-deploy_mitmproxy() {
+# Function to deploy Mitmproxy and the demo pod
+deploy_mitmproxy_and_demo_pod() {
     echo "Deploying Mitmproxy in the $NAMESPACE namespace..."
 
     # Deploy Mitmproxy pod
@@ -109,6 +107,52 @@ spec:
       port: 8080
       targetPort: 8080
 EOF
+
+    echo "Mitmproxy deployed. Now deploying the demo pod for verification."
+
+    # Export the mitmproxy-ca.pem certificate
+    kubectl cp $NAMESPACE/mitmproxy:/root/.mitmproxy/mitmproxy-ca.pem ./mitmproxy-ca.pem
+
+    # Create a secret from the mitmproxy-ca.pem certificate
+    kubectl create secret generic mitmproxysecret --from-file=mitmproxy-ca.pem -n $NAMESPACE
+
+    # Deploy a demo pod to validate the setup
+    kubectl apply -n $NAMESPACE -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mitm-demo-pod
+spec:
+  containers:
+  - name: mitm-demo
+    image: $PODIMAGE
+    command:
+    - sleep
+    args:
+    - 5000s
+    lifecycle:
+      postStart:
+        exec:
+          command:
+          - bash
+          - -c
+          - cp /certs/mitmproxy-ca.pem /usr/local/share/ca-certificates/mitmproxy-ca.crt; update-ca-certificates --fresh
+    env:
+    - name: http_proxy
+      value: "http://mitmproxy-svc.$NAMESPACE:8080/"
+    - name: https_proxy
+      value: "http://mitmproxy-svc.$NAMESPACE:8080/"
+    volumeMounts:
+    - mountPath: /certs
+      name: mitmproxysecret
+      readOnly: true
+  volumes:
+  - name: mitmproxysecret
+    secret:
+      secretName: mitmproxysecret
+EOF
+
+    echo "Demo pod deployed. Use the verification step to confirm setup."
 }
 
 # Function to detect which service mesh is being used
@@ -229,8 +273,10 @@ modify_service_mesh_policies() {
     esac
 }
 
+
 # Main execution
-echo "Starting the attack simulation..."
+echo "Starting the proxy..."
 deploy_mitmproxy
 modify_service_mesh_policies
-echo "Attack simulation complete."
+echo "Proxy complete."
+
